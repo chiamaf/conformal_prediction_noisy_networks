@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
-import sklearn
-import matplotlib as plt
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
 import networkx as nx
 
 """
@@ -30,37 +30,33 @@ def generate_graph(n, sparsity=0.5, lam=1.0, seed=None):
     rng = np.random.default_rng(seed)
 
     # Latent node positions
-    U = rng.uniform(0, 1, n)
+    latent_node_pos = rng.uniform(0, 1, n)
+    eta_s = rng.uniform(0,1,(n,n))
+    w = 3.0 * np.abs(latent_node_pos[:, None] - latent_node_pos[None, :])
+    threshold = np.minimum(sparsity * w, 1.0)
 
-    # Graphon probabilities
-    dist = np.abs(U[:, None] - U[None, :])
-    P = sparsity * np.exp(-lam * dist)
+    A = (eta_s <= threshold).astype(int)
+    np.fill_diagonal(A, 0)
 
-    # No self-loops
-    np.fill_diagonal(P, 0)
-
-    # Generate symmetric adjacency matrix
-    A = np.zeros((n, n), dtype=int)
-    upper = rng.binomial(1, P)
-    upper = np.triu(upper, k=1)
+    upper = np.triu(A,k=1)
     A = upper + upper.T
 
-    return A, U
+    return A, latent_node_pos
 
 
-def generate_data(A, U, beta_x=1.0, beta_z=2.0,
-                  noise_x=0.5, noise_y=1.0, seed=None):
+def generate_data(A,latent_node_pos, beta_0 = 0.0, beta_x=1.0, beta_z=2.0,
+                  noise_x=1.0, noise_y=1, seed=None):
 
     rng = np.random.default_rng(seed)
-    n = len(U)
+    n = len(latent_node_pos)
 
     # Individual covariate
-    X = U + rng.normal(0, noise_x, n)
+    X = latent_node_pos + rng.normal(0, noise_x, n)
 
     # True neighborhood average
     degree = A.sum(axis=1)
     Z = np.divide(
-        A @ X,
+        A @ X, # neighborhood total
         degree,
         out=np.zeros(n),
         where=degree > 0
@@ -68,6 +64,7 @@ def generate_data(A, U, beta_x=1.0, beta_z=2.0,
 
     # Response depends on BOTH individual and network information
     Y = (
+        beta_0 +
         beta_x * X
         + beta_z * Z
         + rng.normal(0, noise_y, n)
@@ -79,31 +76,72 @@ def generate_data(A, U, beta_x=1.0, beta_z=2.0,
 # 2. SAMPLING (INVARIANT SELECTOR)
 # ---------------------------------------------------------------------------
 
-#TODO: rewrite for non bipartite graph
-def ego_sample_proteins(A, seed_protein_idx):
-    """
-    Ego sampling: given a seed protein, sample all compounds connected to it
-    (its "ego network" on the true graph).
+def ego_sample(A, ego_node):
+    neighbors = np.nonzero(A[ego_node])
+    return neighbors
 
-    This is applied to the TRUE adjacency matrix A, since in simulation we
-    have full access to it (unlike in real life). This mirrors Lunde's
-    invariant selector definition.
+# ---------------------------------------------------------------------------
+# 2b. WAVE SAMPLING (exact hop-distance k, excludes all closer waves)
+# ---------------------------------------------------------------------------
 
-    Returns:
-        compound_idx : indices of sampled compounds (neighbors of seed)
-        protein_idx  : indices of sampled proteins (just the seed, for now;
-                       extend to snowball sampling if needed)
+def wave_sample(A, seed_nodes, k):
     """
-    compound_idx = np.where(A[:, seed_protein_idx] == 1)[0]
-    protein_idx = np.array([seed_protein_idx])
-    return compound_idx, protein_idx
+    Return node indices at EXACT hop-distance k from seed_nodes.
+    wave 0 = seed_nodes themselves; wave k excludes waves 0..k-1.
+    """
+    if np.isscalar(seed_nodes):
+        seed_nodes = [seed_nodes]
+
+    visited = set(seed_nodes)
+    frontier = set(seed_nodes)
+
+    for _ in range(k):
+        next_frontier = set()
+        for node in frontier:
+            neighbors = np.nonzero(A[node])[0]
+            next_frontier.update(neighbors.tolist())
+        next_frontier -= visited
+        visited |= next_frontier
+        frontier = next_frontier
+
+    return sorted(frontier)
+
+
+# ---------------------------------------------------------------------------
+# 2c. UNION-OF-HOPS SAMPLING (cumulative ball of radius k)
+# ---------------------------------------------------------------------------
+
+def union_hop_sample(A, seed_nodes, k, include_seed=True):
+    """
+    Return node indices within hop-distance <= k from seed_nodes
+    (union of waves 0 through k).
+    """
+    if np.isscalar(seed_nodes):
+        seed_nodes = [seed_nodes]
+
+    visited = set(seed_nodes)
+    frontier = set(seed_nodes)
+
+    for _ in range(k):
+        next_frontier = set()
+        for node in frontier:
+            neighbors = np.nonzero(A[node])[0]
+            next_frontier.update(neighbors.tolist())
+        next_frontier -= visited
+        visited |= next_frontier
+        frontier = next_frontier
+
+    if not include_seed:
+        visited -= set(seed_nodes)
+
+    return sorted(visited)
 
 
 # ---------------------------------------------------------------------------
 # 3. MEASUREMENT ERROR MODEL (APPLIED ONLY WITHIN THE SAMPLE)
 # ---------------------------------------------------------------------------
 
-def apply_measurement_error(A_sample, alpha, beta, seed=None):
+def apply_measurement_error(A_sample, gamma, beta, seed=None):
     """
     Apply homogeneous Bernoulli measurement error to a SAMPLED subgraph.
 
@@ -116,9 +154,10 @@ def apply_measurement_error(A_sample, alpha, beta, seed=None):
         A_hat : noisy version of A_sample, same shape
     """
     rng = np.random.default_rng(seed)
-    flip_prob = np.where(A_sample == 1, beta, alpha)
+    flip_prob = np.where(A_sample == 1, beta, gamma)
     flips = rng.binomial(1, flip_prob)
     A_hat = np.where(flips == 1, 1 - A_sample, A_sample)
+    np.fill_diagonal(A_hat,0)
     return A_hat
 
 
@@ -126,36 +165,19 @@ def apply_measurement_error(A_sample, alpha, beta, seed=None):
 # 4. NETWORK STATISTICS (ZETA FUNCTION)
 # ---------------------------------------------------------------------------
 
-def compute_degree_statistic(A_sub):
-    """
-    Simple network statistic: compound degree within the sampled subgraph.
-    Replace/extend this with richer statistics (e.g. weighted neighbor
-    averages) as needed -- this is your `zeta` function.
-
-    Returns:
-        Z : array of degree values, one per compound in the sample
-    """
+def compute_node_degree(A_sub):
     return A_sub.sum(axis=1)
 
-
-# ---------------------------------------------------------------------------
-# 5. RESPONSE GENERATION
-# ---------------------------------------------------------------------------
-
-#TODO: delete
-def generate_response(X, Z, noise_std=1.0, seed=None):
-    """
-    Generate a synthetic response Y as a function of covariates X and the
-    TRUE network statistic Z, plus independent mean-zero noise.
-
-    Y = mu*(X, Z) + epsilon
-
-    Using a simple linear form here; swap in something more complex later.
-    """
-    rng = np.random.default_rng(seed)
-    epsilon = rng.normal(0, noise_std, size=len(X))
-    Y = 1.0 * X + 0.5 * Z + epsilon
-    return Y
+def compute_neighborhood_average_covariates(A_sub, X):
+    degree = A_sub.sum(axis=1)
+    n=len(X)
+    Z = np.divide(
+        A_sub @ X,  # neighborhood total
+        degree,
+        out=np.zeros(n),
+        where=degree > 0
+    )
+    return Z
 
 
 # ---------------------------------------------------------------------------
@@ -175,18 +197,18 @@ def split_conformal_quantile(residuals, alpha_level):
 
 def run_split_cp(mu_hat, X_cal, Y_cal, Z_cal, X_test, Y_test, Z_test, alpha_level=0.1):
     """
-    Run split conformal prediction given a fitted predictor mu_hat.
+    Run split conformal prediction given fitted mu_hat. Uses absolute residuals.
 
     Returns:
         q_hat    : calibration quantile
         covered  : bool, whether Y_test falls inside the prediction interval
         width    : interval width (2 * q_hat)
     """
-    cal_preds = mu_hat(X_cal, Z_cal)
+    cal_preds = mu_hat.predict(np.column_stack([X_cal, Z_cal]))
     residuals = np.abs(Y_cal - cal_preds)
     q_hat = split_conformal_quantile(residuals, alpha_level)
 
-    test_pred = mu_hat(X_test, Z_test)
+    test_pred = mu_hat.predict(np.column_stack([X_test, Z_test]))
     covered = np.abs(Y_test - test_pred) <= q_hat
     width = 2 * q_hat
 
@@ -197,8 +219,10 @@ def run_split_cp(mu_hat, X_cal, Y_cal, Z_cal, X_test, Y_test, Z_test, alpha_leve
 # 7. ONE FULL REPLICATE (TRUE vs NOISY PIPELINE)
 # ---------------------------------------------------------------------------
 
-def run_one_replicate(n_compounds, n_proteins, lam, alpha, beta,
-                       seed_protein_idx, alpha_level=0.1, seed=None):
+def run_one_replicate(A, latent_node_pos, n, lam, gamma, beta, ego, wave, union_hop, wave_number,
+                       seed_nodes, alpha_level=0.1, seed=None,
+                      train_frac = 0.45, cal_frac=0.3,
+                      ):
     """
     Run a single Monte Carlo replicate:
       - fixed true graph (should be generated ONCE outside this function
@@ -210,47 +234,72 @@ def run_one_replicate(n_compounds, n_proteins, lam, alpha, beta,
     NOTE: for the conditional-on-true-graph design discussed earlier,
     pass in a pre-generated A rather than regenerating it here.
     """
-    rng_seed = seed
+    rng=np.random.default_rng(seed)
+    #Generate data
+    beta_x, beta_z = rng.normal(0,1,2)
 
-    # --- true graph (regenerate here only if NOT conditioning on fixed A) ---
-    A, U, W = generate_bipartite_graphon(n_compounds, n_proteins, lam=lam, seed=rng_seed)
+    X,Z,Y = generate_data(A, latent_node_pos,beta_x, beta_z, seed)
 
     # --- sample (invariant selector applied to TRUE graph) ---
-    compound_idx, protein_idx = ego_sample_proteins(A, seed_protein_idx)
-    A_sample = A[np.ix_(compound_idx, protein_idx)]
+    sample_idx =[]
+    if ego:
+        sample_idx = ego_sample(A, seed_nodes[0])[0].tolist()
+    elif wave:
+        sample_idx = wave_sample(A,seed_nodes,wave_number)
+    elif union_hop:
+        sample_idx = union_hop_sample(A, seed_nodes,wave_number, False)
+
+    A_sample = A[np.ix_(sample_idx,sample_idx)]
+    X_sample = X[sample_idx]
+    Y_sample = Y[sample_idx]
 
     # --- apply measurement error ONLY within the sample ---
-    A_hat_sample = apply_measurement_error(A_sample, alpha, beta, seed=rng_seed)
+    A_hat_sample = apply_measurement_error(A_sample, gamma, beta, seed)
 
-    # --- true and noisy network statistics ---
-    Z_true = compute_degree_statistic(A_sample)
-    Z_hat = compute_degree_statistic(A_hat_sample)
+    #STATISTICS
+    true_neighborhood_avg = compute_neighborhood_average_covariates(A_sample,X_sample)
+    noisy_neighborhood_avg = compute_neighborhood_average_covariates(A_hat_sample,X_sample)
 
-    # --- covariates and response (uses TRUE Z, since Y depends on true network) ---
-    X = U[compound_idx]
-    Y = generate_response(X, Z_true, seed=rng_seed)
+    true_degree = compute_node_degree(A_sample)
+    noisy_degree = compute_node_degree(A_hat_sample)
 
-    # --- calibration / test split ---
-    n_sample = len(compound_idx)
+    # --- train/cal/test split, within sample---
+    n_sample = len(X_sample)
     idx = np.arange(n_sample)
-    rng = np.random.default_rng(rng_seed)
-    rng.shuffle(idx)
-    split = n_sample // 2
-    cal_idx, test_idx = idx[:split], idx[split:]
 
-    # --- fixed predictor mu* (fit once on true data conceptually;
-    #     here just a placeholder linear function -- replace with sklearn model) ---
-    def mu_star(x, z):
-        return 1.0 * x + 0.5 * z
+    idx_train, idx_rest = train_test_split(idx, train_size=train_frac, random_state=seed)
+
+    rel_cal_frac = cal_frac / (1-train_frac)
+    cal_idx, test_idx = train_test_split(idx_rest, train_size=rel_cal_frac, random_state=seed)
+
+    # mu 1: correctly specified model.
+    mu_1_true = LinearRegression().fit(
+        np.column_stack([X_sample[idx_train], true_neighborhood_avg[idx_train]]),
+        Y_sample[idx_train]
+    )
+    mu_1_noisy = LinearRegression().fit(
+        np.column_stack([X_sample[idx_train], noisy_neighborhood_avg[idx_train]]),
+        Y_sample[idx_train]
+    )
+
+    # mu 2: incorrectly specified, uses degree as statistic instead
+    mu_2_true = LinearRegression().fit(
+        np.column_stack([X_sample[idx_train], true_degree[idx_train]]),
+        Y_sample[idx_train]
+    )
+    mu_2_noisy = LinearRegression().fit(
+        np.column_stack([X_sample[idx_train], noisy_degree[idx_train]]),
+        Y_sample[idx_train]
+    )
 
     q_true, covered_true, width_true = run_split_cp(
-        mu_star, X[cal_idx], Y[cal_idx], Z_true[cal_idx],
-        X[test_idx], Y[test_idx], Z_true[test_idx], alpha_level
+        mu_1_true, X_sample[cal_idx], Y_sample[cal_idx], true_neighborhood_avg[cal_idx],
+        X_sample[test_idx], Y_sample[test_idx], true_neighborhood_avg[test_idx], alpha_level
     )
 
     q_noisy, covered_noisy, width_noisy = run_split_cp(
-        mu_star, X[cal_idx], Y[cal_idx], Z_hat[cal_idx],
-        X[test_idx], Y[test_idx], Z_hat[test_idx], alpha_level
+        mu_1_noisy, X_sample[cal_idx], Y_sample[cal_idx], noisy_neighborhood_avg[cal_idx],
+        X_sample[test_idx], Y_sample[test_idx], noisy_neighborhood_avg[test_idx], alpha_level
     )
 
     return {
@@ -258,3 +307,5 @@ def run_one_replicate(n_compounds, n_proteins, lam, alpha, beta,
         "covered_true": covered_true, "covered_noisy": covered_noisy,
         "width_true": width_true, "width_noisy": width_noisy,
     }
+
+
